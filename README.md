@@ -39,6 +39,61 @@ The emitted PTX targets sm_89 (PTX 8.5); the driver compiles it forward for newe
 herbert-cuda-probe --emit /tmp/ptx && for f in /tmp/ptx/*.ptx; do ptxas -arch=sm_89 -o /dev/null $f; done
 ```
 
+## What the emitted PTX looks like
+
+Every kernel is written as PTX text by the engine at start-up, for the shape of the model and the card. `herbert-cuda-probe --emit DIR` writes them all to files without a GPU (444 modules for the two models). Below, three unedited passages of one of them: `gemm_1024x7168_bf16_64x128x32_w2x2_s2.ptx`, the prefill GEMM of the 0.8B `gate_up` projection (1024 → 7168) at its default tile, 64×128, K = 32, two stages.
+
+The header:
+
+```
+//
+// gemm_1024x7168_bf16_64x128x32_w2x2_s2, emitted by herbert-cuda-bf16
+//
+.version 8.5
+.target sm_89
+.address_size 64
+```
+
+The top of the main loop: wait for the tile in flight, synchronize, then start the asynchronous copy of the next tile from global to shared memory (`cp.async`, no registers involved):
+
+```
+L0:
+	cp.async.wait_group 0;
+	bar.sync 0;
+	add.u32 %r82, %r81, 1;
+	setp.lt.u32 %p2, %r82, 32;
+	@!%p2 bra L1;
+	add.u32 %r83, %r18, %r80;
+	cp.async.cg.shared.global [%r83], [%rd9], 16, %r16;
+	add.u32 %r84, %r27, %r80;
+	cp.async.cg.shared.global [%r84], [%rd13], 16, %r25;
+	add.u32 %r85, %r35, %r80;
+	cp.async.cg.shared.global [%r85], [%rd17], 16;
+	add.u32 %r86, %r43, %r80;
+	cp.async.cg.shared.global [%r86], [%rd21], 16;
+	add.u32 %r87, %r51, %r80;
+	cp.async.cg.shared.global [%r87], [%rd25], 16;
+	add.u32 %r88, %r59, %r80;
+	cp.async.cg.shared.global [%r88], [%rd29], 16;
+	cp.async.commit_group;
+```
+
+The computation on the current tile: fragments loaded from shared memory by `ldmatrix`, then bf16 tensor-core products accumulated in f32 by `mma`:
+
+```
+	ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r91, %r92, %r93, %r94}, [%r89];
+	ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r95, %r96, %r97, %r98}, [%r89+1280];
+	ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r99, %r100, %r101, %r102}, [%r90];
+	ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r103, %r104, %r105, %r106}, [%r90+1280];
+	ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r107, %r108, %r109, %r110}, [%r90+2560];
+	ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r111, %r112, %r113, %r114}, [%r90+3840];
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%f0, %f1, %f2, %f3}, {%r91, %r92, %r93, %r94}, {%r99, %r100}, {%f0, %f1, %f2, %f3};
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%f4, %f5, %f6, %f7}, {%r91, %r92, %r93, %r94}, {%r101, %r102}, {%f4, %f5, %f6, %f7};
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%f8, %f9, %f10, %f11}, {%r91, %r92, %r93, %r94}, {%r103, %r104}, {%f8, %f9, %f10, %f11};
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%f12, %f13, %f14, %f15}, {%r91, %r92, %r93, %r94}, {%r105, %r106}, {%f12, %f13, %f14, %f15};
+	...
+```
+
 ## Measured on
 
 An RTX 4080 16 GB (sm_89, 76 SM) in a Ryzen 9 9900X machine under Linux, NVIDIA driver 595.99.02, SM clock locked at 2 805 MHz and memory at 11 201 MHz, the card held in P0 under CUDA by the application profile `CudaNoStablePerfLimit` (without it the driver keeps the card in P2 during any CUDA context). Built with the stable Rust toolchain (1.98), release profile `opt-level=3`, no LTO. On macOS the crate only compiles (`cargo check`).
